@@ -132,7 +132,7 @@ def process_gerber_layer(outline, arc_subdivision=1):
     paths = []
 
     # convert raw coordinate to float in mm
-    coord = lambda x: float(x)/(10**decimals)/unit_convert
+    coord = lambda x: (float(x)/(10**decimals))*unit_convert
 
     lineno = 0
     ln = outline[lineno]
