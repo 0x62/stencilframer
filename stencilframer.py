@@ -360,6 +360,7 @@ def main():
 
     # 3D model specifics
     parser.add_argument('-f', '--frame', help="Generate stencil holding frame instead of stencil frame", action='store_true')
+    parser.add_argument('-c', '--chamfer', help="Specify the percentage of the frame side length to chamfer (max 50)", type=float, default=20)
     parser.add_argument('-k', '--skip-holes', help="Don't add holes for easy removal in the fixture", action='store_true')
     parser.add_argument('-o', '--offset', help="Offset between the PCB/stencil and frame edge (mm)", type=float, default=0.1)
     parser.add_argument('--stencil-offset', help="Offset between the stencil and frame edge (mm). If not specified, the --offset is used", type=float, default=None)
@@ -491,7 +492,8 @@ def main():
                 'ymax': max([p[1] for p in pol_stencil]),
                 }
         # add chamfer to frame
-        chamf = min([(stencil_bounds['xmax']-stencil_bounds['xmin'])/5, (stencil_bounds['ymax']-stencil_bounds['ymin'])/5, 15])
+        args.chamfer = min((args.chamfer, 50,))
+        chamf = min([(stencil_bounds['xmax']-stencil_bounds['xmin'])*args.chamfer/100.0, (stencil_bounds['ymax']-stencil_bounds['ymin'])*args.chamfer/100.0])
         pol_frame_out = [
             (stencil_bounds['xmin']+chamf, stencil_bounds['ymin']),
             (stencil_bounds['xmax']-chamf, stencil_bounds['ymin']),

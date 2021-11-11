@@ -41,6 +41,8 @@ optional arguments:
   -s SHAPE, --shape SHAPE
                         Index of the desired shape from input file (default: 0)
   -f, --frame           Generate stencil holding frame instead of stencil frame (default: False)
+  -c CHAMFER, --chamfer CHAMFER
+                        Specify the percentage of the frame side length to chamfer (max 50) (default: 20)
   -k, --skip-holes      Don't add holes for easy removal in the fixture (default: False)
   -o OFFSET, --offset OFFSET
                         Offset between the PCB/stencil and frame edge (mm) (default: 0.1)
