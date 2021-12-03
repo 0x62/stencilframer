@@ -2,7 +2,7 @@
 
 A script which will take the KiCAD PCB  or Gerber file and, using OpenSCAD, generate the 3D model of a fixture able to hold the stencil and the PCB in place (for applying the solder paste). It can also generate a frame to hold the stencil in place.
 
-Only dependencies are OpenSCAD and Python. For Python versions lower than 3.4 additional dependency is enum module (add it with `pip install enum` if needed).
+Only dependencies are OpenSCAD and Python (works in both 2 and 3). For Python versions lower than 3.4 additional dependency is enum module (add it with `pip install enum` if needed).
 
 It can generate STL or AMF file for slicing, PNG image or directly output the OpenSCAD code for further editing.
 
