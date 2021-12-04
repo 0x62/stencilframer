@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -387,7 +388,9 @@ def main():
         logging.warning("unsupported output file extension")
         return 1
 
-    if os.system(args.openscad+" -v")!=0:
+    try:
+        subprocess.check_output((args.openscad, "-v",))
+    except subprocess.CalledProcessError:
         logging.warning("OpenSCAD executable not found on the system.")
         return 1
 
@@ -554,13 +557,21 @@ def main():
             fd, name = tempfile.mkstemp()
             os.write(fd, code.encode('utf-8'))
             os.close(fd)
-            cmd = "openscad {infile} -o {outfile}".format(infile=name, outfile=args.outfile)
-            os.system(cmd)
+            cmd = (args.openscad, name, '-o', args.outfile,)
+            try:
+                subprocess.check_output(cmd)
+            except subprocess.CalledProcessError as e:
+                print("Failed to generate the output file")
+                print(str(e))
             os.unlink(name)
 
         else:
-            cmd = "openscad /dev/null -D '{code}' -o {outfile}".format(code=code, outfile=args.outfile)
-            os.system(cmd)
+            cmd = (args.openscad, '/dev/null', '-D', code, '-o', args.outfile,)
+            try:
+                subprocess.check_output(cmd)
+            except subprocess.CalledProcessError as e:
+                print("Failed to generate the output file")
+                print(str(e))
 
     return 0
 
