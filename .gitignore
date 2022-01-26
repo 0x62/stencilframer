@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.spec
+
+# PyCharm project configuration files
+.idea
+*.pyc
+
+# Backup files
+*.bak
+
+# Log files
+*.log
+
+# Virtual environment
+.venv
+
+# VS Code configuration files
+.vscode
+
+# PyInstaller build and dist output folders
+build
+dist
+
+# Windows system files
+desktop.ini
+
+# Stencil framer input/output files
+*.kicad_pcb
+*.gbr
+*.gm1
+*.stl
+*.amf
+*.png
+*.pdf
+*.scad

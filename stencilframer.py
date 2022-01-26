@@ -150,6 +150,18 @@ def process_gerber_layer(outline, arc_subdivision=1):
             decimals = int(fmts[0][1:])
             logging.debug("coordinate format set to %d.%d", decimals, total_coord)
 
+        elif ln.startswith('%FSA'):  # Altium-generated Gerber defined precision with %FSA line instead of %FSLA
+            # parse decimal format
+            try:
+                fmts = re.findall(r'FSAX([0-9]+)Y([0-9]+)', ln)[0]
+            except IndexError:
+                raise ValueError("Invalid coordinate format specified")
+            if len(fmts)!=2 or fmts[0]!=fmts[1]:
+                raise ValueError("Invalid coordinate format specified")
+            integers = int(fmts[0][0])
+            decimals = int(fmts[0][1:])
+            logging.debug("coordinate format set to %d.%d", decimals, total_coord)
+
         elif ln.startswith('%MOIN') or ln.startswith('G70*'):
             # units in inches - convert to mm
             unit_convert = 25.4
