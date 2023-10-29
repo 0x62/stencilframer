@@ -600,6 +600,8 @@ def main():
             # add points across the arc
             angle_step = 1 # 1°
             angle = 0
+            if p['angle']==0:
+                p['angle'] = 360 # circle
             while abs(angle)<abs(p['angle']):
                 pol.append(rotate_point(point=p['start'], center=p['center'], angle_deg=angle))
                 angle += angle_step * (1 if p.get('swapped', False) else -1)
