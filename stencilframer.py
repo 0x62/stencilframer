@@ -48,6 +48,11 @@ class CoordFormat(enum.Enum):
 
 
 def rotate_point(point, center, angle_deg):
+    """
+    Rotate a point around a center point by a given angle (in degrees).
+
+    Arguments are tuples of (x, y) coordinates.
+    """
     st = (point[0]-center[0], point[1]-center[1]) # translate to (0,0)
     angle_rad = angle_deg/180.0*math.pi
 
@@ -67,70 +72,237 @@ def distance(p1, p2):
 
 
 def get_angle(s, e, c):
+    # get angle between two points and a center point (in degrees)
     arg = distance(s, e)/2 / distance(s, c)
     return math.asin(arg) * 2 / math.pi * 180
 
 
-def parse_kicad_element(el):
-    parts = el.strip("()").split(' ')
-    if parts[0] in ('start', 'end'):
-        return parts[0], tuple((float(pp) for pp in parts[1:]))
-    return parts[0]
+def parse_sexp(expr):
+    # Simple S-expression parser
+    # parse a big s-expression into a dictionary
+    # when certain attributes are repeated, they are merged into a list
+    #
+    # Input is a string containing the s-expression
+    # Output is a tuple (attr, dict) where attr is the name of the node and dict is a dictionary
+    level = 0
+    maxlevel = 0
+    start_idx = -1
+    end_idx = -1
+    children = []
+    expr = expr[1:-1] # strip parenthesis
 
+    # extract attribute name (first string until whitespace or open parenthesis)
+    attr = ''
+    inside_quotes = False
+    for i in range(len(expr)):
+        if expr[i]=='"':
+            inside_quotes = not inside_quotes
+        if expr[i] in (' ', '(', ')') and not inside_quotes:
+            attr = expr[:i]
+            break
 
-def process_kicad_layer(outline, arc_subdivision=1):
-    # extract data
-    # example:
-    #   (gr_line (start 215.75 65.5) (end 226.25 65.5) (layer Edge.Cuts) (width 0.05) (tstamp 61516B52))
-    #   (gr_arc (start 208.75 46) (end 212.25 46) (angle -90) (layer Edge.Cuts) (width 0.05) (tstamp 61516B4C))
-    paths = []
-    for ln in outline:
-        if "(layer Edge.Cuts)" not in ln:
-            # extract only the Edge.Cuts layer
-            continue
+    if attr=='':
+        return expr, {}
 
-        p = {
-                'type': ln.strip("()").split(' ')[0].split('_')[-1]
-                }
+    inside_quotes = False
+    for i in range(len(attr), len(expr)):
+        if expr[i]=='"':
+            inside_quotes = not inside_quotes
+        if expr[i]=='(' and not inside_quotes:
+            if level==0:
+                start_idx = i
+            level += 1
+            if level>maxlevel:
+                maxlevel = level
+        elif expr[i]==')' and not inside_quotes:
+            if level==1:
+                end_idx = i
+                k, v = parse_sexp(expr[start_idx:end_idx+1])
+                children.append({k: v})
+            level -= 1
+    if maxlevel==0:
+        # no sub-expressions, extract value
+        val_raw = expr[len(attr):].strip("() '\"'")
+        val = None
+        # currently supported values:
+        #   - float
+        #   - list of floats (space separated)
+        #   - string
+        try:
+            if val_raw.find(' ')!=-1:
+                val = [float(x) for x in val_raw.split()]
+            else:
+                val = float(val_raw)
+        except ValueError:
+            val = val_raw
+        children.append({'value': val})
+        #return attr, val
 
-        if p['type'] not in ('line', 'arc'):
-            continue
-
-        for el in re.findall(r'\([0-9a-zA-Z\. -]*\)', ln):
-            el_p = el.strip("()").split(' ')
-            if el_p[0] in ('start', 'end'):
-                p[el_p[0]] = tuple((float(pp) for pp in el_p[1:]))
-            elif el_p[0]=='angle':
-                p[el_p[0]] = float(el_p[1])
-
-        if p['type']=='arc':
-            # FIXME: revisit arc orientation
-            # on arc, the 'start' is the center point and 'end' is starting point
-            # transform data
-
-            # do the rotation
-            p['center'] = p['start']
-            p['start'] = rotate_point(point=p['end'], center=p['start'], angle_deg=-p['angle']) # angle has wrong orientation
-            logging.debug("interpolating arc from %s to %s", p['start'], p['end'])
+    # if there are multiple children with the same name, merge them into a list
+    el = {}
+    for i in range(len(children)):
+        k = list(children[i].keys())[0]
+        if k in el:
+            if type(el[k])!=list:
+                el[k] = [el[k]]
+            el[k].append(children[i][k])
         else:
-            logging.debug("interpolating line from %s to %s", p['start'], p['end'])
+            el[k] = children[i][k]
+    return attr, el
 
-        paths.append(p)
+
+def process_kicad_layer(infile):
+    """
+    Parse the Kicad PCB file and extract all graphic primitives on Edge.Cuts layer.
+
+    Kicad pcb file is just a big s-expression. Main node is "kicad_pcb" and it contains a list
+    of all elements as s-expressions.
+    Full specification is here: https://dev-docs.kicad.org/en/file-formats/sexpr-intro/index.html#_graphic_items
+
+    infile is a path to a kicad pcb file
+    """
+
+    # not the most memory efficient way to parse this but it will be fine for this
+    with open(infile, "r") as fin:
+        node, data = parse_sexp(fin.read())
+
+    if node!="kicad_pcb" or type(data)!=dict:
+        raise ValueError("Invalid Kicad PCB file")
+
+    paths = []
+
+    # make sure all elements are lists to avoid checks later
+    for elt in ('gr_arc', 'gr_circle', 'gr_line', 'gr_poly', 'gr_rect'):
+        if elt not in data:
+            data[elt] = []
+        if type(data[elt])!=list:
+            data[elt] = [data[elt]]
+
+    # handle lines
+    for p in data['gr_line']:
+        if 'layer' not in p or p['layer']['value']!="Edge.Cuts":
+            continue
+        if 'angle' in p:
+            # angle is optional parameter. We need to rotate the line around the center
+            cent = ((p['start']['value'][0]+p['end']['value'][0])/2, (p['start']['value'][1]+p['end']['value'][1])/2)
+            logging.warning("Line rotation hasn't been tested yet. Please report any issues. %s", p)
+            paths.append({
+                'type': 'line',
+                'start': rotate_point(p['start']['value'], cent, p['angle']['value']),
+                'end': rotate_point(p['end']['value'], cent, p['angle']['value']),
+                })
+        else:
+            paths.append({
+                'type': 'line',
+                'start': p['start']['value'],
+                'end': p['end']['value'],
+                })
+
+    # handle arcs
+    for p in data['gr_arc']:
+        if 'layer' not in p or p['layer']['value']!="Edge.Cuts":
+            continue
+        # we have three points on arc (start, mid, end) and need to calculate the center
+        A = p['start']['value']
+        B = p['mid']['value']
+        C = p['end']['value']
+        ma = (B[1]-A[1])/(B[0]-A[0])
+        mb = (C[1]-B[1])/(C[0]-B[0])
+        x = (ma*mb*(A[1]-C[1]) + mb*(A[0]+B[0]) - ma*(B[0]+C[0]))/(2*(mb-ma))
+        y = -1/ma*(x-(A[0]+B[0])/2) + (A[1]+B[1])/2
+        cent = (x, y)
+        paths.append({
+            'type': 'arc',
+            'start': A,
+            'end': C,
+            'center': cent,
+            'angle': get_angle(C, A, cent),
+            })
+
+    # handle circles
+    for p in data['gr_circle']:
+        if 'layer' not in p or p['layer']['value']!="Edge.Cuts":
+            continue
+        # interpret as two arcs
+        radius = distance(p['center']['value'], p['end']['value'])
+        paths.append({
+            'type': 'arc',
+            'start': (p['center']['value'][0]+radius, p['center']['value'][1]),
+            'end': (p['center']['value'][0]-radius, p['center']['value'][1]),
+            'center': p['center']['value'],
+            'angle': 180,
+            })
+        paths.append({
+            'type': 'arc',
+            'start': (p['center']['value'][0]-radius, p['center']['value'][1]),
+            'end': (p['center']['value'][0]+radius, p['center']['value'][1]),
+            'center': p['center']['value'],
+            'angle': 180,
+            })
+
+    # handle polygons
+    for p in data['gr_poly']:
+        if 'layer' not in p or p['layer']['value']!="Edge.Cuts":
+            continue
+        for i in range(1, len(p['pts']['xy'])):
+            paths.append({
+                'type': 'line',
+                'start': p['pts']['xy'][i-1]['value'],
+                'end': p['pts']['xy'][i]['value']
+                })
+        paths.append({
+            'type': 'line',
+            'start': p['pts']['xy'][-1]['value'],
+            'end': p['pts']['xy'][0]['value']
+            })
+
+    # handle rectangles
+    for p in data['gr_rect']:
+        if 'layer' not in p or p['layer']['value']!="Edge.Cuts":
+            continue
+        # interpret as four lines
+        start = p['start']['value']
+        end = p['end']['value']
+        paths.append({
+            'type': 'line',
+            'start': [start[0], start[1]],
+            'end': [end[0], start[1]]
+            })
+        paths.append({
+            'type': 'line',
+            'start': [end[0], start[1]],
+            'end': [end[0], end[1]]
+            })
+        paths.append({
+            'type': 'line',
+            'start': [end[0], end[1]],
+            'end': [start[0], end[1]]
+            })
+        paths.append({
+            'type': 'line',
+            'start': [start[0], end[1]],
+            'end': [start[0], start[1]]
+            })
 
     return paths
 
 
-def process_gerber_layer(outline, arc_subdivision=1):
-    apertures = {}
-    integers = 4
+def process_gerber_layer(infile):
+    """
+    Parse the gerber file containing the outline and extract all of the graphic primitives
+    """
     decimals = 6
     unit_convert = 1
     total_coord = 6
     interpolation = Interpolation.LINEAR
     point = (0,0)
-    coord_format = CoordFormat.ABSOLUTE
 
     paths = []
+
+    outline = []
+    with open(infile, "r") as fin:
+        for line in fin:
+            outline.append(line.strip())
 
     # convert raw coordinate to float in mm
     coord = lambda x: (float(x)/(10**decimals))*unit_convert
@@ -146,7 +318,6 @@ def process_gerber_layer(outline, arc_subdivision=1):
                 raise ValueError("Invalid coordinate format specified")
             if len(fmts)!=2 or fmts[0]!=fmts[1]:
                 raise ValueError("Invalid coordinate format specified")
-            integers = int(fmts[0][0])
             decimals = int(fmts[0][1:])
             logging.debug("coordinate format set to %d.%d", decimals, total_coord)
 
@@ -194,13 +365,11 @@ def process_gerber_layer(outline, arc_subdivision=1):
 
         elif ln.startswith('G90'):
             # set the coordinates to absolute (legacy)
-            coord_format = CoordFormat.ABSOLUTE
             logging.debug("coordinate format set to absolute")
             ln = ln[3:] # continue parsing the same line
             continue
         elif ln.startswith('G91'):
             # set the coordinates to absolute (legacy)
-            coord_format = CoordFormat.INCREMENTAL
             logging.debug("coordinate format set to incremental")
             ln = ln[3:] # continue parsing the same line
             continue
@@ -260,7 +429,7 @@ def process_gerber_layer(outline, arc_subdivision=1):
                 logging.warning("Failed to parse coordinates: %s", ln)
 
             center = None
-            if i is not None:
+            if i is not None and j is not None:
                 center = (point[0]+i, point[1]+j)
 
             if ln.endswith('D02*') or ln.endswith('D2*'):
@@ -312,24 +481,23 @@ def process_gerber_layer(outline, arc_subdivision=1):
 
 
 def sort_paths(paths):
-    current = paths[0]
+    """
+    Sorts the paths into shapes - each shape is a list of paths that are connected to each other
+    """
     rest = paths[1:]
 
     shapes = []
     current_shape = [paths[0],]
     while len(rest):
-        rem = None
         for idx, p in enumerate(rest):
             # check if it starts at the end of the previous segment
             if distance(p['start'], current_shape[-1]['end'])<0.01:
-                rem = idx
                 break
             if distance(p['end'], current_shape[-1]['end'])<0.01:
                 s = p['start']
                 p['start'] = p['end']
                 p['end'] = s
                 p['swapped'] = True
-                rem = idx
                 break
         else:
             #raise ValueError("the outline isn't a closed shape")
@@ -338,7 +506,7 @@ def sort_paths(paths):
             continue
 
         current_shape.append(rest[idx])
-        del(rest[idx])
+        del rest[idx]
 
     shapes.append(current_shape)
     return shapes
@@ -375,14 +543,11 @@ def main():
 
     args = parser.parse_args()
 
-
     logfmt = '[%(levelname)s] %(message)s'
     if args.debug:
         logging.basicConfig(level=logging.DEBUG, format=logfmt)
     else:
         logging.basicConfig(level=logging.INFO, format=logfmt)
-
-    outline_raw = []
 
     if not any([args.outfile.endswith(ext) for ext in extensions]):
         logging.warning("unsupported output file extension")
@@ -405,18 +570,15 @@ def main():
         logging.warning("invalid input file format")
         return 1
 
+    shapes = []
     try:
-        with open(args.infile, "r") as fin:
-            for line in fin:
-                outline_raw.append(line.strip())
+        if informat==InFormat.KICAD:
+            shapes = sort_paths(process_kicad_layer(args.infile))
+        elif informat==InFormat.GERBER:
+            shapes = sort_paths(process_gerber_layer(args.infile))
     except IOError:
-        logging.warning("input file not found")
+        logging.error("error while processing the input file")
         return 1
-
-    if informat==InFormat.KICAD:
-        shapes = sort_paths(process_kicad_layer(outline_raw))
-    elif informat==InFormat.GERBER:
-        shapes = sort_paths(process_gerber_layer(outline_raw))
 
     if len(shapes)>0:
         logging.info("Found %d closed shapes inside the file", len(shapes))
@@ -424,9 +586,12 @@ def main():
         logging.warning("No shapes found in the PCB file")
         return 1
 
-
-    # TODO: find the outer shape (the one with greatest surface, for now just take the first one
-    paths = shapes[args.shape]
+    # TODO: find the outer shape (the one with greatest surface, for now just take the first one)
+    try:
+        paths = shapes[args.shape]
+    except IndexError:
+        logging.error("Invalid shape index (the file contains only %d closed shapes)", len(shapes))
+        return
 
     # prepare list of points for OpenSCAD polygon (i.e. expand arcs)
     pol = []
@@ -458,8 +623,6 @@ def main():
         # mirror around y axis
         pol = [(-p[0], p[1]) for p in pol]
 
-    stencil_margins= [20, 20, 20, 20]
-
     # find polygon boundaries
     bounds = {
             'xmin': min([p[0] for p in pol]),
@@ -483,7 +646,7 @@ def main():
             ]
 
     # OpenSCAD code generation start
-
+    # ----------------------------------
     code = ""
 
     if args.frame:
@@ -578,3 +741,4 @@ def main():
 
 if __name__=='__main__':
     sys.exit(main())
+
