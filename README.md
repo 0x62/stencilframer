@@ -10,6 +10,8 @@ More info at [https://hyperglitch.com/articles/stencilframer](https://hyperglitc
 
 ![Fixture holding the PCB and stencil](https://hyperglitch.com/public/images/stencilframer/stencilframer4.jpg)
 
+Update 2023/10/29: updated to support KiCAD 6 and newer.
+
 
 ## Usage
 
