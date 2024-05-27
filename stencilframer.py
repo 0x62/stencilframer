@@ -102,7 +102,7 @@ def parse_sexp(expr):
             break
 
     if attr=='':
-        return expr, {}
+        return expr.strip(), {}
 
     inside_quotes = False
     for i in range(len(attr), len(expr)):
@@ -148,7 +148,7 @@ def parse_sexp(expr):
             el[k].append(children[i][k])
         else:
             el[k] = children[i][k]
-    return attr, el
+    return attr.strip(), el
 
 
 def process_kicad_layer(infile):
