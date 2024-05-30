@@ -546,6 +546,8 @@ def main():
     parser.add_argument('-o', '--offset', help="Offset between the PCB/stencil and frame edge (mm)", type=float, default=0.1)
     parser.add_argument('--stencil-offset', help="Offset between the stencil and frame edge (mm). If not specified, the --offset is used", type=float, default=None)
 
+    parser.add_argument('--base-thickness', help="Height of the base of the stencil frame (mm)", type=float, default=1)
+
     parser.add_argument('-d', '--debug', help="Show debugging info", action='store_true')
     parser.add_argument('-w', '--use-temp-file', help="Use temporary file when calling OpenSCAD (used by default on Windows)", action='store_true')
 
@@ -701,7 +703,7 @@ def main():
 
         stencil_cutout = "translate([0, 0, {thick}]) linear_extrude(height=5) offset(r={offset}) polygon(points={points});".format(points=str([list(p) for p in pol_stencil]), offset=args.stencil_offset, thick=args.pcb_thickness)
 
-        base = "translate([0, 0, {vert}]) linear_extrude(height={height}) polygon(points={points});".format(points=str([list(p) for p in pol_base]), height=3+args.pcb_thickness, vert=-1)
+        base = "translate([0, 0, {vert}]) linear_extrude(height={height}) polygon(points={points});".format(points=str([list(p) for p in pol_base]), height=2+args.pcb_thickness+args.base_thickness, vert=-args.base_thickness+0.005) # add 5um to avoid z-fighting
 
         holes = ""
         if not args.skip_holes:
