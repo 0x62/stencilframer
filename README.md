@@ -20,14 +20,15 @@ Run the script with `-h` or `--help` to see the usage options.
 ```
 > ./stencilframer.py --help
 usage: stencilframer.py [-h] [-l MARGIN_LEFT] [-r MARGIN_RIGHT] [-t MARGIN_TOP] [-b MARGIN_BOTTOM] [-m] [-p PCB_THICKNESS] [-s SHAPE]
-                        [-f] [-k] [-o OFFSET] [--stencil-offset STENCIL_OFFSET] [--openscad OPENSCAD]
+                        [-f] [-c CHAMFER] [-k] [-o OFFSET] [--stencil-offset STENCIL_OFFSET] [--base-thickness BASE_THICKNESS] [-d] [-w]
+                        [--openscad OPENSCAD]
                         infile outfile
 
 positional arguments:
   infile                path to KiCad PCB or gerber file (.kicad_pcb, .gbr, .gm1)
   outfile               path to output file (extension can be .stl, .amf, .png, .pdf, .scad)
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -l MARGIN_LEFT, --margin-left MARGIN_LEFT
                         Left margin (mm) (default: 20)
@@ -50,6 +51,10 @@ optional arguments:
                         Offset between the PCB/stencil and frame edge (mm) (default: 0.1)
   --stencil-offset STENCIL_OFFSET
                         Offset between the stencil and frame edge (mm). If not specified, the --offset is used (default: None)
+  --base-thickness BASE_THICKNESS
+                        Height of the base of the stencil frame (mm) (default: 1)
+  -d, --debug           Show debugging info (default: False)
+  -w, --use-temp-file   Use temporary file when calling OpenSCAD (used by default on Windows) (default: False)
   --openscad OPENSCAD   Path to OpenSCAD executable (default: openscad)
 ```
 
