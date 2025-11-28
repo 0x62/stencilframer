@@ -90,6 +90,7 @@ def parse_sexp(expr):
     end_idx = -1
     children = []
     expr = expr[1:-1] # strip parenthesis
+    expr = expr.replace('\"', '')  # remove escaped quotes from fields for easier parsing
 
     # extract attribute name (first string until whitespace or open parenthesis)
     attr = ''
@@ -143,7 +144,7 @@ def parse_sexp(expr):
     for i in range(len(children)):
         k = list(children[i].keys())[0]
         if k in el:
-            if type(el[k])!=list:
+            if type(el[k]) is not list:
                 el[k] = [el[k]]
             el[k].append(children[i][k])
         else:
@@ -166,7 +167,7 @@ def process_kicad_layer(infile):
     with open(infile, "r") as fin:
         node, data = parse_sexp(fin.read())
 
-    if node!="kicad_pcb" or type(data)!=dict:
+    if node!="kicad_pcb" or type(data) is not dict:
         raise ValueError("Invalid Kicad PCB file")
 
     paths = []
@@ -175,7 +176,7 @@ def process_kicad_layer(infile):
     for elt in ('gr_arc', 'gr_circle', 'gr_line', 'gr_poly', 'gr_rect'):
         if elt not in data:
             data[elt] = []
-        if type(data[elt])!=list:
+        if type(data[elt]) is not list:
             data[elt] = [data[elt]]
 
     # handle lines
