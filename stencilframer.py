@@ -24,6 +24,7 @@
 
 import argparse
 import enum
+import itertools
 import logging
 import math
 import os
@@ -75,6 +76,14 @@ def get_angle(s, e, c):
     # get angle between two points and a center point (in degrees)
     arg = distance(s, e)/2 / distance(s, c)
     return math.asin(arg) * 2 / math.pi * 180
+
+
+def angle_between(p1, p2):
+    return math.atan2(p2[1]-p1[1], p2[0]-p1[0])
+
+
+def triangle_area(p1, p2, p3):
+    return abs((p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1]))/2.0)
 
 
 def parse_sexp(expr):
@@ -165,7 +174,7 @@ def process_kicad_layer(infile):
 
     # not the most memory efficient way to parse this but it will be fine for this
     with open(infile, "r") as fin:
-        node, data = parse_sexp(fin.read())
+        node, data = parse_sexp(fin.read().strip())
 
     if node!="kicad_pcb" or type(data) is not dict:
         raise ValueError("Invalid Kicad PCB file")
@@ -286,6 +295,71 @@ def process_kicad_layer(infile):
             })
 
     return paths
+
+
+def load_kicad_pcb(infile):
+    with open(infile, "r") as fin:
+        node, data = parse_sexp(fin.read().strip())
+
+    if node!="kicad_pcb" or type(data) is not dict:
+        raise ValueError("Invalid Kicad PCB file")
+
+    return data
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if type(value) is list:
+        return value
+    return [value]
+
+
+def sexp_value(node, default=None):
+    if type(node) is dict and 'value' in node:
+        return node['value']
+    return default
+
+
+def kicad_at(node):
+    value = sexp_value(node, [])
+    if type(value) is not list:
+        value = [value]
+    x = value[0] if len(value)>0 else 0
+    y = value[1] if len(value)>1 else 0
+    angle = value[2] if len(value)>2 else 0
+    return (x, y, angle)
+
+
+def kicad_layers(node):
+    value = sexp_value(node, "")
+    if type(value) is list:
+        return [str(v) for v in value]
+    return str(value).split()
+
+
+def extract_kicad_paste_pads(infile, paste_layer):
+    """
+    Extract paste pad centers from a KiCad PCB file.
+    """
+    data = load_kicad_pcb(infile)
+    pads = []
+
+    for footprint in as_list(data.get('footprint')) + as_list(data.get('module')):
+        fp_x, fp_y, fp_angle = kicad_at(footprint.get('at', {}))
+
+        for pad in as_list(footprint.get('pad')):
+            if paste_layer not in kicad_layers(pad.get('layers', {})):
+                continue
+
+            pad_x, pad_y, _pad_angle = kicad_at(pad.get('at', {}))
+            pad_pos = rotate_point((pad_x, pad_y), (0, 0), fp_angle)
+            pads.append({
+                'center': (fp_x+pad_pos[0], fp_y+pad_pos[1]),
+                'size': sexp_value(pad.get('size', {}), [0, 0]),
+                })
+
+    return pads
 
 
 def process_gerber_layer(infile):
@@ -493,6 +567,302 @@ def process_gerber_layer(infile):
     return paths
 
 
+def parse_gerber_coord_format(line):
+    try:
+        fmts = re.findall(r'FSL?A?X([0-9]+)Y([0-9]+)', line)[0]
+    except IndexError:
+        raise ValueError("Invalid coordinate format specified")
+    if len(fmts)!=2 or fmts[0]!=fmts[1]:
+        raise ValueError("Invalid coordinate format specified")
+    return int(fmts[0][1:])
+
+
+def parse_gerber_aperture(line):
+    match = re.match(r'%ADD([0-9]+)([A-Z]),([^*]+)\*%', line)
+    if not match:
+        return None
+
+    code = int(match.group(1))
+    shape = match.group(2)
+    params = []
+    for part in re.split(r'[Xx]', match.group(3)):
+        try:
+            params.append(float(part))
+        except ValueError:
+            pass
+
+    if shape not in ('C', 'R', 'O'):
+        return None
+
+    return code, {
+            'shape': shape,
+            'params': params,
+            }
+
+
+def parse_gerber_xy(line, coord, current_point):
+    x = current_point[0]
+    y = current_point[1]
+
+    match = re.search(r'X([0-9\-]+)', line)
+    if match:
+        x = coord(match.group(1))
+
+    match = re.search(r'Y([0-9\-]+)', line)
+    if match:
+        y = coord(match.group(1))
+
+    return (x, y)
+
+
+def gerber_command(line):
+    match = re.search(r'D0?([123])\*$', line)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_near_rectangle(pol, tolerance=0.05):
+    if len(pol)<4:
+        return False
+
+    bounds = polygon_bounds(pol)
+    width = bounds['xmax']-bounds['xmin']
+    height = bounds['ymax']-bounds['ymin']
+    if width<=tolerance or height<=tolerance:
+        return False
+
+    side_touches = {
+            'xmin': False,
+            'xmax': False,
+            'ymin': False,
+            'ymax': False,
+            }
+    for point in pol:
+        if point[0]<bounds['xmin']-tolerance or point[0]>bounds['xmax']+tolerance:
+            return False
+        if point[1]<bounds['ymin']-tolerance or point[1]>bounds['ymax']+tolerance:
+            return False
+
+        if abs(point[0]-bounds['xmin'])<=tolerance:
+            side_touches['xmin'] = True
+        if abs(point[0]-bounds['xmax'])<=tolerance:
+            side_touches['xmax'] = True
+        if abs(point[1]-bounds['ymin'])<=tolerance:
+            side_touches['ymin'] = True
+        if abs(point[1]-bounds['ymax'])<=tolerance:
+            side_touches['ymax'] = True
+
+    if not all(side_touches.values()):
+        return False
+
+    return abs(polygon_area(pol))/(width*height) >= 0.70
+
+
+def is_rectangular_footprint_points(points, tolerance=0.05):
+    if len(points)<4:
+        return False
+
+    bounds = polygon_bounds(points)
+    if bounds['xmax']-bounds['xmin']<=tolerance or bounds['ymax']-bounds['ymin']<=tolerance:
+        return False
+
+    side_touches = {
+            'xmin': False,
+            'xmax': False,
+            'ymin': False,
+            'ymax': False,
+            }
+    for point in points:
+        on_xmin = abs(point[0]-bounds['xmin'])<=tolerance
+        on_xmax = abs(point[0]-bounds['xmax'])<=tolerance
+        on_ymin = abs(point[1]-bounds['ymin'])<=tolerance
+        on_ymax = abs(point[1]-bounds['ymax'])<=tolerance
+        if not (on_xmin or on_xmax or on_ymin or on_ymax):
+            return False
+
+        side_touches['xmin'] = side_touches['xmin'] or on_xmin
+        side_touches['xmax'] = side_touches['xmax'] or on_xmax
+        side_touches['ymin'] = side_touches['ymin'] or on_ymin
+        side_touches['ymax'] = side_touches['ymax'] or on_ymax
+
+    return all(side_touches.values())
+
+
+def path_endpoints(paths):
+    points = []
+    for path in paths:
+        points.append(path['start'])
+        points.append(path['end'])
+    return points
+
+
+def rect_from_bounds(bounds):
+    return [
+            (bounds['xmin'], bounds['ymin']),
+            (bounds['xmin'], bounds['ymax']),
+            (bounds['xmax'], bounds['ymax']),
+            (bounds['xmax'], bounds['ymin']),
+            ]
+
+
+def polygon_bounds(pol):
+    return {
+            'xmin': min([p[0] for p in pol]),
+            'xmax': max([p[0] for p in pol]),
+            'ymin': min([p[1] for p in pol]),
+            'ymax': max([p[1] for p in pol]),
+            }
+
+
+def parse_gerber_stencil(infile):
+    """
+    Parse a Gerber stencil file for flashed apertures and the largest closed outline.
+    """
+    decimals = 6
+    unit_convert = 1
+    point = (0, 0)
+    selected_aperture = None
+    current_operation = None
+    apertures = {}
+    paths = []
+    flashes = []
+    regions = []
+    region_paths = None
+
+    with open(infile, "r") as fin:
+        lines = [line.strip() for line in fin]
+
+    coord = lambda x: (float(x)/(10**decimals))*unit_convert
+
+    for line in lines:
+        if not line:
+            continue
+
+        if line.startswith('%FSLA') or line.startswith('%FSA'):
+            decimals = parse_gerber_coord_format(line)
+            coord = lambda x: (float(x)/(10**decimals))*unit_convert
+            continue
+
+        if line.startswith('%MOIN') or line.startswith('G70*'):
+            unit_convert = 25.4
+            coord = lambda x: (float(x)/(10**decimals))*unit_convert
+            continue
+
+        if line.startswith('%MOMM') or line.startswith('G71*'):
+            unit_convert = 1
+            coord = lambda x: (float(x)/(10**decimals))*unit_convert
+            continue
+
+        if line.startswith('%ADD'):
+            aperture = parse_gerber_aperture(line)
+            if aperture is not None:
+                apertures[aperture[0]] = aperture[1]
+            continue
+
+        if line.startswith('G04') or line.startswith('%'):
+            continue
+
+        if line.startswith('G36'):
+            region_paths = []
+            continue
+
+        if line.startswith('G37'):
+            if region_paths:
+                regions.append(region_paths)
+            region_paths = None
+            continue
+
+        if line.startswith('D') and line.endswith('*'):
+            try:
+                selected_aperture = int(line[1:-1])
+            except ValueError:
+                pass
+            continue
+
+        if line.startswith('G01'):
+            line = line[3:]
+        elif line.startswith('G02') or line.startswith('G03'):
+            # Use a chord for rounded stencil corners. The rectangular footprint
+            # comes from the largest outline bounds, so exact arc geometry is not
+            # needed for stencil sizing.
+            line = line[3:]
+
+        if not (line.startswith('X') or line.startswith('Y')):
+            continue
+
+        new_point = parse_gerber_xy(line, coord, point)
+        command = gerber_command(line)
+        if command is None:
+            command = current_operation
+        else:
+            current_operation = command
+
+        if command==2:
+            point = new_point
+        elif command==1:
+            path = {
+                'type': 'line',
+                'start': point,
+                'end': new_point,
+                }
+            if region_paths is None:
+                paths.append(path)
+            else:
+                region_paths.append(path)
+            point = new_point
+        elif command==3:
+            aperture = apertures.get(selected_aperture)
+            if aperture is not None:
+                flashes.append({
+                    'center': new_point,
+                    'aperture': aperture,
+                    })
+            point = new_point
+
+    shapes = sort_paths(paths) if paths else []
+    polygons = []
+    for shape in shapes:
+        if distance(shape[0]['start'], shape[-1]['end'])<0.01:
+            pol = paths_to_polygon(shape)
+            if len(pol)>=3:
+                polygons.append(pol)
+
+    if polygons:
+        outline = max(polygons, key=lambda pol: abs(polygon_area(pol)))
+        if not is_near_rectangle(outline):
+            raise ValueError("Largest stencil outline is not rectangular")
+    else:
+        outline = path_endpoints(paths)
+        if not is_rectangular_footprint_points(outline, tolerance=0.5):
+            raise ValueError("No closed stencil outline found in Gerber file")
+
+    bounds = polygon_bounds(outline)
+    outline = rect_from_bounds(bounds)
+    flashes = [flash for flash in flashes if point_in_polygon(flash['center'], outline)]
+    region_centers = []
+    for region in regions:
+        if not region or distance(region[0]['start'], region[-1]['end'])>=0.01:
+            continue
+
+        region_pol = paths_to_polygon(region)
+        if len(region_pol)<3:
+            continue
+
+        center = polygon_center(region_pol)
+        if point_in_polygon(center, outline):
+            region_centers.append(center)
+
+    pads = [flash['center'] for flash in flashes] + region_centers
+    if len(pads)<3:
+        raise ValueError("Stencil Gerber contains fewer than 3 usable apertures inside the outline")
+
+    return {
+            'outline': outline,
+            'pads': pads,
+            }
+
+
 def sort_paths(paths):
     """
     Sorts the paths into shapes - each shape is a list of paths that are connected to each other
@@ -525,6 +895,326 @@ def sort_paths(paths):
     return shapes
 
 
+def paths_to_polygon(paths):
+    """
+    Expand a closed path into a polygon suitable for OpenSCAD.
+    """
+    pol = []
+    for p in paths:
+        if p['type']=='arc':
+            # add points across the arc
+            angle_step = 1 # 1°
+            angle = 0
+            if p['angle']==0:
+                p['angle'] = 360 # circle
+            while abs(angle)<abs(p['angle']):
+                pol.append(rotate_point(point=p['start'], center=p['center'], angle_deg=angle))
+                angle += angle_step * (1 if p.get('swapped', False) else -1)
+        else:
+            pol.append(p['start'])
+
+    return pol
+
+
+def polygon_area(pol):
+    """
+    Return the signed area of a polygon.
+    """
+    area = 0
+    for i in range(len(pol)):
+        p1 = pol[i]
+        p2 = pol[(i+1)%len(pol)]
+        area += p1[0]*p2[1] - p2[0]*p1[1]
+    return area/2.0
+
+
+def point_in_polygon(point, pol):
+    """
+    Return True if point is inside pol.
+    """
+    inside = False
+    j = len(pol)-1
+    for i in range(len(pol)):
+        pi = pol[i]
+        pj = pol[j]
+        if ((pi[1]>point[1]) != (pj[1]>point[1])):
+            x_intersect = (pj[0]-pi[0]) * (point[1]-pi[1]) / (pj[1]-pi[1]) + pi[0]
+            if point[0] < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
+def polygon_center(pol):
+    """
+    Return a simple center point for containment and translation.
+    """
+    return (sum((p[0] for p in pol))/len(pol), sum((p[1] for p in pol))/len(pol), )
+
+
+def transform_polygon(pol, center, mirror_y=False, mirror_x=False):
+    """
+    Translate and mirror a polygon using the same transforms as the selected PCB outline.
+    """
+    pol = [(p[0]-center[0], p[1]-center[1],) for p in pol]
+    if mirror_y:
+        pol = [(p[0], -p[1]) for p in pol]
+    if mirror_x:
+        pol = [(-p[0], p[1]) for p in pol]
+    return pol
+
+
+def format_polygon(pol):
+    """
+    Format polygon points for OpenSCAD.
+    """
+    return str([list(p) for p in pol])
+
+
+def find_void_polygons(shapes, selected_idx, selected_polygon, selected_center, min_area, mirror_y=False, mirror_x=False):
+    """
+    Find closed shapes inside selected_polygon that are large enough to fill.
+    """
+    void_polygons = []
+    for idx, shape in enumerate(shapes):
+        if idx==selected_idx:
+            continue
+
+        void_raw = paths_to_polygon(shape)
+        if len(void_raw)<3:
+            continue
+
+        if abs(polygon_area(void_raw)) < min_area:
+            continue
+
+        if not point_in_polygon(polygon_center(void_raw), selected_polygon):
+            continue
+
+        void_polygons.append(transform_polygon(void_raw, selected_center, mirror_y=mirror_y, mirror_x=mirror_x))
+
+    return void_polygons
+
+
+def select_anchor_pads(points):
+    if len(points)<3:
+        raise ValueError("At least 3 pads are required for stencil alignment")
+
+    farthest = None
+    farthest_distance = -1
+    for p1, p2 in itertools.combinations(points, 2):
+        dd = distance(p1, p2)
+        if dd>farthest_distance:
+            farthest = (p1, p2)
+            farthest_distance = dd
+
+    third = None
+    max_area = -1
+    for point in points:
+        if point==farthest[0] or point==farthest[1]:
+            continue
+        area = triangle_area(farthest[0], farthest[1], point)
+        if area>max_area:
+            third = point
+            max_area = area
+
+    if third is None or max_area<0.01:
+        raise ValueError("Could not find 3 well-spaced stencil pads for alignment")
+
+    return [farthest[0], farthest[1], third]
+
+
+def nearest_unused_point(point, candidates, used):
+    nearest_idx = None
+    nearest_dist = None
+    for idx, candidate in enumerate(candidates):
+        if idx in used:
+            continue
+        dd = distance(point, candidate)
+        if nearest_dist is None or dd<nearest_dist:
+            nearest_idx = idx
+            nearest_dist = dd
+    return nearest_idx, nearest_dist
+
+
+def translation_matches(anchors, pcb_points, offset):
+    used = set()
+    matches = []
+    max_residual = 0
+    for anchor in anchors:
+        target = (anchor[0]+offset[0], anchor[1]+offset[1])
+        idx, residual = nearest_unused_point(target, pcb_points, used)
+        if idx is None:
+            return None, None
+        used.add(idx)
+        max_residual = max(max_residual, residual)
+        matches.append(pcb_points[idx])
+    return max_residual, matches
+
+
+def refine_translation(anchors, matches):
+    dx = sum([matches[i][0]-anchors[i][0] for i in range(len(anchors))])/float(len(anchors))
+    dy = sum([matches[i][1]-anchors[i][1] for i in range(len(anchors))])/float(len(anchors))
+    return (dx, dy)
+
+
+def transform_stencil_points(points, flip_y=False, offset=(0, 0)):
+    transformed = []
+    for point in points:
+        p = (point[0], -point[1]) if flip_y else point
+        transformed.append((p[0]+offset[0], p[1]+offset[1]))
+    return transformed
+
+
+def find_translation_match(stencil_points, pcb_points, tolerance=0.25):
+    anchors = select_anchor_pads(stencil_points)
+    best = None
+
+    for anchor in anchors:
+        for pcb_point in pcb_points:
+            offset = (pcb_point[0]-anchor[0], pcb_point[1]-anchor[1])
+            residual, matches = translation_matches(anchors, pcb_points, offset)
+            if matches is None:
+                continue
+            refined = refine_translation(anchors, matches)
+            residual, matches = translation_matches(anchors, pcb_points, refined)
+            if matches is None:
+                continue
+            if best is None or residual<best['residual']:
+                best = {
+                        'offset': refined,
+                        'residual': residual,
+                        'anchors': anchors,
+                        }
+
+    if best is not None and best['residual']<=tolerance:
+        return best
+
+    return None
+
+
+def rotate_point_math(point, center, angle_rad):
+    st = (point[0]-center[0], point[1]-center[1])
+    return (
+            center[0] + st[0]*math.cos(angle_rad) - st[1]*math.sin(angle_rad),
+            center[1] + st[0]*math.sin(angle_rad) + st[1]*math.cos(angle_rad),
+            )
+
+
+def detect_rotation_required(stencil_points, pcb_points, tolerance=0.25, rotation_tolerance_deg=0.25):
+    anchors = select_anchor_pads(stencil_points)
+    best = None
+
+    for i, j in itertools.permutations(range(len(anchors)), 2):
+        a1 = anchors[i]
+        a2 = anchors[j]
+        anchor_dist = distance(a1, a2)
+        if anchor_dist<0.01:
+            continue
+
+        for p1, p2 in itertools.permutations(pcb_points, 2):
+            if abs(distance(p1, p2)-anchor_dist)>tolerance:
+                continue
+
+            angle = angle_between(p1, p2) - angle_between(a1, a2)
+            rotated = [rotate_point_math(anchor, a1, angle) for anchor in anchors]
+            offset = (p1[0]-rotated[i][0], p1[1]-rotated[i][1])
+            residual, _matches = translation_matches(rotated, pcb_points, offset)
+            if residual is None:
+                continue
+
+            angle_deg = abs(angle*180.0/math.pi)
+            while angle_deg>180:
+                angle_deg = abs(angle_deg-360)
+            if best is None or residual<best['residual']:
+                best = {
+                        'residual': residual,
+                        'angle_deg': angle_deg,
+                        }
+
+    if best is not None and best['residual']<=tolerance and best['angle_deg']>rotation_tolerance_deg:
+        return best['angle_deg']
+
+    return None
+
+
+def match_stencil_to_pcb_pads(stencil_points, pcb_pads, tolerance=0.25, rotation_tolerance_deg=0.25):
+    pcb_points = [pad['center'] if type(pad) is dict else pad for pad in pcb_pads]
+    best = None
+    rotation_required = None
+
+    for flip_y in (False, True):
+        variant = transform_stencil_points(stencil_points, flip_y=flip_y)
+        match = find_translation_match(variant, pcb_points, tolerance=tolerance)
+        if match is not None:
+            match['flip_y'] = flip_y
+            if best is None or match['residual']<best['residual']:
+                best = match
+            continue
+
+        angle = detect_rotation_required(variant, pcb_points, tolerance=tolerance, rotation_tolerance_deg=rotation_tolerance_deg)
+        if angle is not None and (rotation_required is None or angle<rotation_required):
+            rotation_required = angle
+
+    if best is not None:
+        return best
+
+    if rotation_required is not None:
+        raise ValueError("Stencil alignment would require %.3f degrees of rotation, which is unsupported" % (rotation_required,))
+
+    raise ValueError("Could not match stencil apertures to PCB paste pads")
+
+
+def aligned_stencil_polygon(stencil_polygon, alignment):
+    return transform_stencil_points(stencil_polygon, flip_y=alignment.get('flip_y', False), offset=alignment['offset'])
+
+
+def is_supported_stencil_file(path):
+    return path.lower().endswith(('.gbr', '.ger', '.gtp', '.gbp', '.gts', '.gbs'))
+
+
+def automatic_lift_hole(pol):
+    maxlen = 0
+    maxidx = -1
+    for i in range(len(pol)):
+        dd = distance(pol[i], pol[(i-1)%len(pol)])
+        if dd>maxlen:
+            maxidx = i
+            maxlen = dd
+
+    d = min(maxlen/2, 10)
+    return {
+            'x': (pol[maxidx][0]+pol[(maxidx-1)%len(pol)][0])/2,
+            'y': (pol[maxidx][1]+pol[(maxidx-1)%len(pol)][1])/2,
+            'r': d/2,
+            }
+
+
+def positioned_lift_hole(pol, position):
+    if position=='auto':
+        return automatic_lift_hole(pol)
+
+    bounds = polygon_bounds(pol)
+    xmid = (bounds['xmin']+bounds['xmax'])/2
+    ymid = (bounds['ymin']+bounds['ymax'])/2
+    radius = automatic_lift_hole(pol)['r']
+    positions = {
+            'l': (bounds['xmin'], ymid),
+            'r': (bounds['xmax'], ymid),
+            't': (xmid, bounds['ymin']),
+            'b': (xmid, bounds['ymax']),
+            'tl': (bounds['xmin'], bounds['ymin']),
+            'tr': (bounds['xmax'], bounds['ymin']),
+            'bl': (bounds['xmin'], bounds['ymax']),
+            'br': (bounds['xmax'], bounds['ymax']),
+            }
+    x, y = positions[position]
+    return {
+            'x': x,
+            'y': y,
+            'r': radius,
+            }
+
+
 def main():
     extensions = ('.stl', '.amf', '.png', '.pdf', '.scad')
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -539,11 +1229,15 @@ def main():
     parser.add_argument('-m', '--mirror', help="Mirror the PCB (to get the bottom side up)", action='store_true')
     parser.add_argument('-p', '--pcb-thickness', help="Thickness of the PCB (mm)", type=float, default=1.6)
     parser.add_argument('-s', '--shape', help="Index of the desired shape from input file", type=int, default=0)
+    parser.add_argument('--fill-voids', help="Fill PCB voids larger than --min-void-area", action='store_true')
+    parser.add_argument('--min-void-area', help="Minimum PCB void area to fill (mm^2)", type=float, default=15)
+    parser.add_argument('--stencil-file', help="Gerber stencil file to automatically size and align the stencil opening", type=str, default=None)
 
     # 3D model specifics
     parser.add_argument('-f', '--frame', help="Generate stencil holding frame instead of stencil frame", action='store_true')
     parser.add_argument('-c', '--chamfer', help="Specify the percentage of the frame side length to chamfer (max 50)", type=float, default=20)
     parser.add_argument('-k', '--skip-holes', help="Don't add holes for easy removal in the fixture", action='store_true')
+    parser.add_argument('--lift-hole-position', help="PCB lift cutout position", choices=('auto', 'l', 'r', 't', 'b', 'tl', 'tr', 'bl', 'br'), default='auto')
     parser.add_argument('-o', '--offset', help="Offset between the PCB/stencil and frame edge (mm)", type=float, default=0.1)
     parser.add_argument('--stencil-offset', help="Offset between the stencil and frame edge (mm). If not specified, the --offset is used", type=float, default=None)
 
@@ -570,7 +1264,7 @@ def main():
 
     try:
         subprocess.check_output((args.openscad, "-v",))
-    except subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         logging.warning("OpenSCAD executable not found on the system.")
         return 1
 
@@ -584,6 +1278,14 @@ def main():
     else:
         logging.warning("invalid input file format")
         return 1
+
+    if args.stencil_file is not None:
+        if informat!=InFormat.KICAD:
+            logging.error("--stencil-file requires a .kicad_pcb input so PCB paste pads can be matched")
+            return 1
+        if not is_supported_stencil_file(args.stencil_file):
+            logging.error("--stencil-file currently supports Gerber files only")
+            return 1
 
     shapes = []
     try:
@@ -609,57 +1311,75 @@ def main():
         return
 
     # prepare list of points for OpenSCAD polygon (i.e. expand arcs)
-    pol = []
-    for p in paths:
-        if p['type']=='arc':
-            # add points across the arc
-            angle_step = 1 # 1°
-            angle = 0
-            if p['angle']==0:
-                p['angle'] = 360 # circle
-            while abs(angle)<abs(p['angle']):
-                pol.append(rotate_point(point=p['start'], center=p['center'], angle_deg=angle))
-                angle += angle_step * (1 if p.get('swapped', False) else -1)
-        else:
-            pol.append(p['start'])
+    pol_raw = paths_to_polygon(paths)
 
-    # find center and translate
-    pth_c = (sum((p[0] for p in pol))/len(pol), sum((p[1] for p in pol))/len(pol), )
-    pol = [(p[0]-pth_c[0], p[1]-pth_c[1],) for p in pol]
-
-    if not pol:
+    if not pol_raw:
         logging.warning("no shape found on Edge.Cuts layer")
         return 1
+
+    # find center and translate
+    pth_c = polygon_center(pol_raw)
+    pol = transform_polygon(pol_raw, pth_c)
 
     # since the KiCAD and OpenSCAD use different y-axis direction, the polygon is mirrored
     # by default
     if informat==InFormat.KICAD:
-        pol = [(p[0], -p[1]) for p in pol]
+        pol = transform_polygon(pol_raw, pth_c, mirror_y=True)
 
     if args.mirror:
         # mirror around y axis
         pol = [(-p[0], p[1]) for p in pol]
 
-    # find polygon boundaries
-    bounds = {
-            'xmin': min([p[0] for p in pol]),
-            'xmax': max([p[0] for p in pol]),
-            'ymin': min([p[1] for p in pol]),
-            'ymax': max([p[1] for p in pol]),
-            }
-    pol_stencil = [
-            (bounds['xmin']-args.margin_left, bounds['ymin']-args.margin_top),
-            (bounds['xmin']-args.margin_left, bounds['ymax']+args.margin_bottom),
-            (bounds['xmax']+args.margin_right, bounds['ymax']+args.margin_bottom),
-            (bounds['xmax']+args.margin_right, bounds['ymin']-args.margin_top)
-            ]
+    void_polygons = []
+    if args.fill_voids:
+        if args.min_void_area < 0:
+            logging.error("minimum void area must be non-negative")
+            return 1
+
+        void_polygons = find_void_polygons(
+                shapes=shapes,
+                selected_idx=args.shape,
+                selected_polygon=pol_raw,
+                selected_center=pth_c,
+                min_area=args.min_void_area,
+                mirror_y=(informat==InFormat.KICAD),
+                mirror_x=args.mirror)
+        logging.info("Filling %d PCB void(s) with area >= %s mm^2", len(void_polygons), args.min_void_area)
 
     base_margin = 5
+
+    if args.stencil_file is not None:
+        try:
+            paste_layer = 'B.Paste' if args.mirror else 'F.Paste'
+            pcb_pads = extract_kicad_paste_pads(args.infile, paste_layer)
+            if len(pcb_pads)<3:
+                logging.error("PCB contains fewer than 3 %s pads for stencil alignment", paste_layer)
+                return 1
+
+            stencil = parse_gerber_stencil(args.stencil_file)
+            alignment = match_stencil_to_pcb_pads(stencil['pads'], pcb_pads)
+            stencil_raw = aligned_stencil_polygon(stencil['outline'], alignment)
+            pol_stencil = transform_polygon(stencil_raw, pth_c, mirror_y=True, mirror_x=args.mirror)
+            logging.info("Using stencil file bounds; matched %s with residual %.3f mm", paste_layer, alignment['residual'])
+        except (IOError, ValueError) as e:
+            logging.error(str(e))
+            return 1
+    else:
+        # find polygon boundaries
+        bounds = polygon_bounds(pol)
+        pol_stencil = [
+                (bounds['xmin']-args.margin_left, bounds['ymin']-args.margin_top),
+                (bounds['xmin']-args.margin_left, bounds['ymax']+args.margin_bottom),
+                (bounds['xmax']+args.margin_right, bounds['ymax']+args.margin_bottom),
+                (bounds['xmax']+args.margin_right, bounds['ymin']-args.margin_top)
+                ]
+
+    stencil_bounds_for_base = polygon_bounds(pol_stencil)
     pol_base = [
-            (bounds['xmin']-args.margin_left-base_margin, bounds['ymin']-args.margin_top-base_margin),
-            (bounds['xmin']-args.margin_left-base_margin, bounds['ymax']+args.margin_bottom+base_margin),
-            (bounds['xmax']+args.margin_right+base_margin, bounds['ymax']+args.margin_bottom+base_margin),
-            (bounds['xmax']+args.margin_right+base_margin, bounds['ymin']-args.margin_top-base_margin)
+            (stencil_bounds_for_base['xmin']-base_margin, stencil_bounds_for_base['ymin']-base_margin),
+            (stencil_bounds_for_base['xmin']-base_margin, stencil_bounds_for_base['ymax']+base_margin),
+            (stencil_bounds_for_base['xmax']+base_margin, stencil_bounds_for_base['ymax']+base_margin),
+            (stencil_bounds_for_base['xmax']+base_margin, stencil_bounds_for_base['ymin']-base_margin)
             ]
 
     # OpenSCAD code generation start
@@ -700,25 +1420,24 @@ def main():
         # generate the actual stencil frame
 
         # arrange cutouts for PCB and stencil
-        pcb_cutout = "linear_extrude(height=10) offset(r={offset}) polygon(points={points}, convexity=10);".format(points=str([list(p) for p in pol]), offset=args.offset)
+        pcb_cutout_outer = "linear_extrude(height=10) offset(r={offset}) polygon(points={points}, convexity=10);".format(points=format_polygon(pol), offset=args.offset)
+        if void_polygons:
+            pcb_void_fills = ""
+            for void_pol in void_polygons:
+                pcb_void_fills += "linear_extrude(height=12) offset(r={offset}) polygon(points={points}, convexity=10);".format(points=format_polygon(void_pol), offset=-args.offset)
+            pcb_cutout = "difference(){{ {outer} union(){{ {voids} }} }}".format(outer=pcb_cutout_outer, voids=pcb_void_fills)
+        else:
+            pcb_cutout = pcb_cutout_outer
 
-        stencil_cutout = "translate([0, 0, {thick}]) linear_extrude(height=5) offset(r={offset}) polygon(points={points});".format(points=str([list(p) for p in pol_stencil]), offset=args.stencil_offset, thick=args.pcb_thickness)
+        stencil_cutout = "translate([0, 0, {thick}]) linear_extrude(height=5) offset(r={offset}) polygon(points={points});".format(points=format_polygon(pol_stencil), offset=args.stencil_offset, thick=args.pcb_thickness)
 
-        base = "translate([0, 0, {vert}]) linear_extrude(height={height}) polygon(points={points});".format(points=str([list(p) for p in pol_base]), height=2+args.pcb_thickness+args.base_thickness, vert=-args.base_thickness+0.005) # add 5um to avoid z-fighting
+        base = "translate([0, 0, {vert}]) linear_extrude(height={height}) polygon(points={points});".format(points=format_polygon(pol_base), height=2+args.pcb_thickness+args.base_thickness, vert=-args.base_thickness+0.005) # add 5um to avoid z-fighting
 
         holes = ""
         if not args.skip_holes:
             # add hole on the longest side of the PCB for easier PCB extraction
-            # FIXME: probably needs another hole or two and better placement
-            maxlen = 0
-            maxidx = -1
-            for i in range(len(pol)):
-                dd = distance(pol[i], pol[(i-1)%len(pol)])
-                if dd>maxlen:
-                    maxidx = i
-                    maxlen = dd
-            d = min(maxlen/2, 10)
-            holes = "translate([{x}, {y}, 0]) cylinder(h=20, r={r}, center=true, $fn=100);".format(x=(pol[maxidx][0]+pol[(maxidx-1)%len(pol)][0])/2, y=(pol[maxidx][1]+pol[(maxidx-1)%len(pol)][1])/2, r=d/2)
+            lift_hole = positioned_lift_hole(pol, args.lift_hole_position)
+            holes = "translate([{x}, {y}, 0]) cylinder(h=20, r={r}, center=true, $fn=100);".format(x=lift_hole['x'], y=lift_hole['y'], r=lift_hole['r'])
 
             # add holes for the stencil removal
             for i in range(4):
@@ -758,4 +1477,3 @@ def main():
 
 if __name__=='__main__':
     sys.exit(main())
-
