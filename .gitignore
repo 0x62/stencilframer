@@ -25,6 +25,9 @@ dist
 # Windows system files
 desktop.ini
 
+# Mac BS
+.DS_Store
+
 # Stencil framer input/output files
 *.kicad_pcb
 *.gbr

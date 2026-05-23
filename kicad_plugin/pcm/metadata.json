@@ -1,0 +1,25 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "Stencilframer",
+  "description": "Generate a stencil frame from a KiCad PCB and stencil Gerber.",
+  "description_full": "Generates a stencil jig STL from the current KiCad PCB and a stencil Gerber (e.g from JLCPCB fabrication outputs)",
+  "identifier": "com-github-0x62-stencilframer",
+  "type": "plugin",
+  "author": {
+    "name": "Ben Lewis",
+    "contact": {
+      "web": "https://github.com/0x62/stencilframer"
+    }
+  },
+  "license": "MIT",
+  "resources": {
+    "homepage": "https://github.com/0x62/stencilframer"
+  },
+  "versions": [
+    {
+      "version": "0.1.0",
+      "status": "testing",
+      "kicad_version": "7.0"
+    }
+  ]
+}
