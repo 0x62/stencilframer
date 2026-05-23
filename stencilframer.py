@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 
 class InFormat(enum.Enum):
@@ -697,6 +698,89 @@ def path_endpoints(paths):
     return points
 
 
+def segment_length(path):
+    return distance(path['start'], path['end'])
+
+
+def point_in_bounds(point, bounds):
+    return bounds['xmin'] <= point[0] <= bounds['xmax'] and bounds['ymin'] <= point[1] <= bounds['ymax']
+
+
+def axis_segment_groups(paths, tolerance=0.5, min_segment_length=1.0):
+    vertical_groups = []
+    horizontal_groups = []
+
+    def add_group(groups, coord, length):
+        for group in groups:
+            if abs(group['coord']-coord)<=tolerance:
+                total = group['length'] + length
+                group['coord'] = (group['coord']*group['length'] + coord*length)/total
+                group['length'] = total
+                return
+        groups.append({
+            'coord': coord,
+            'length': length,
+            })
+
+    for path in paths:
+        dx = path['end'][0]-path['start'][0]
+        dy = path['end'][1]-path['start'][1]
+        length = math.hypot(dx, dy)
+        if length<min_segment_length:
+            continue
+
+        if abs(dx)<=tolerance and abs(dy)>tolerance:
+            add_group(vertical_groups, (path['start'][0]+path['end'][0])/2.0, length)
+        elif abs(dy)<=tolerance and abs(dx)>tolerance:
+            add_group(horizontal_groups, (path['start'][1]+path['end'][1])/2.0, length)
+
+    return {
+            'vertical': vertical_groups,
+            'horizontal': horizontal_groups,
+            }
+
+
+def axis_segment_outline_rect(groups, tolerance=0.5):
+    vertical_groups = groups['vertical']
+    horizontal_groups = groups['horizontal']
+
+    if len(vertical_groups)<2 or len(horizontal_groups)<2:
+        return None
+
+    max_vertical = max(group['length'] for group in vertical_groups)
+    max_horizontal = max(group['length'] for group in horizontal_groups)
+    vertical_candidates = [group for group in vertical_groups if group['length']>=max_vertical*0.5]
+    horizontal_candidates = [group for group in horizontal_groups if group['length']>=max_horizontal*0.5]
+    if len(vertical_candidates)<2 or len(horizontal_candidates)<2:
+        return None
+
+    xmin = min(group['coord'] for group in vertical_candidates)
+    xmax = max(group['coord'] for group in vertical_candidates)
+    ymin = min(group['coord'] for group in horizontal_candidates)
+    ymax = max(group['coord'] for group in horizontal_candidates)
+    if xmax-xmin<=tolerance or ymax-ymin<=tolerance:
+        return None
+
+    return rect_from_bounds({
+            'xmin': xmin,
+            'xmax': xmax,
+            'ymin': ymin,
+            'ymax': ymax,
+            })
+
+
+def detect_outline_axis_segments(paths, tolerance=0.5):
+    groups = axis_segment_groups(paths, tolerance=tolerance)
+    outline = axis_segment_outline_rect(groups, tolerance=tolerance)
+    if outline is None:
+        return None
+    return {
+            'outline': outline,
+            'bounds': polygon_bounds(outline),
+            'strategy': 'axis_segments_fast',
+            }
+
+
 def rect_from_bounds(bounds):
     return [
             (bounds['xmin'], bounds['ymin']),
@@ -715,10 +799,86 @@ def polygon_bounds(pol):
             }
 
 
+def closed_outline_candidates(paths):
+    shapes = sort_paths(paths) if paths else []
+    polygons = []
+    for shape in shapes:
+        if distance(shape[0]['start'], shape[-1]['end'])<0.01:
+            pol = paths_to_polygon(shape)
+            if len(pol)>=3:
+                polygons.append(pol)
+    return polygons
+
+
+def detect_outline_closed_loops(paths):
+    polygons = closed_outline_candidates(paths)
+    if not polygons:
+        return None
+
+    closed_outline = max(polygons, key=lambda pol: abs(polygon_area(pol)))
+    if not is_near_rectangle(closed_outline):
+        return {
+                'error': "Largest stencil outline is not rectangular",
+                'outline_area': abs(polygon_area(closed_outline)),
+                }
+
+    bounds = polygon_bounds(closed_outline)
+    outline = rect_from_bounds(bounds)
+    return {
+            'outline': outline,
+            'bounds': bounds,
+            'strategy': 'closed_loops',
+            'outline_area': abs(polygon_area(closed_outline)),
+            }
+
+
+def detect_outline_endpoint_fallback(paths, tolerance=0.5):
+    outline = path_endpoints(paths)
+    if not is_rectangular_footprint_points(outline, tolerance=tolerance):
+        return None
+
+    bounds = polygon_bounds(outline)
+    return {
+            'outline': rect_from_bounds(bounds),
+            'bounds': bounds,
+            'strategy': 'endpoint_fallback',
+            }
+
+
+def choose_stencil_outline(paths):
+    axis_outline = detect_outline_axis_segments(paths, tolerance=0.5)
+    if axis_outline is not None:
+        return axis_outline
+
+    closed_outline = detect_outline_closed_loops(paths)
+
+    if closed_outline is not None and 'outline' in closed_outline:
+        return closed_outline
+
+    endpoint_outline = detect_outline_endpoint_fallback(paths, tolerance=0.5)
+    if endpoint_outline is not None:
+        return endpoint_outline
+
+    if closed_outline is not None and 'error' in closed_outline:
+        raise ValueError(closed_outline['error'])
+
+    raise ValueError("No closed stencil outline found in Gerber file")
+
+
+def closed_region_center(region):
+    if not region['points'] or distance(region['first'], region['last'])>=0.01:
+        return None
+    return (
+            sum(point[0] for point in region['points'])/float(len(region['points'])),
+            sum(point[1] for point in region['points'])/float(len(region['points'])),
+            )
+
+
 def parse_gerber_stencil(infile):
     """
     Parse a Gerber stencil file for flashed apertures and the largest closed outline.
     """
+    started = time.time()
     decimals = 6
     unit_convert = 1
     point = (0, 0)
@@ -728,7 +888,7 @@ def parse_gerber_stencil(infile):
     paths = []
     flashes = []
     regions = []
-    region_paths = None
+    region = None
 
     with open(infile, "r") as fin:
         lines = [line.strip() for line in fin]
@@ -764,13 +924,17 @@ def parse_gerber_stencil(infile):
             continue
 
         if line.startswith('G36'):
-            region_paths = []
+            region = {
+                    'points': [],
+                    'first': None,
+                    'last': None,
+                    }
             continue
 
         if line.startswith('G37'):
-            if region_paths:
-                regions.append(region_paths)
-            region_paths = None
+            if region is not None:
+                regions.append(region)
+            region = None
             continue
 
         if line.startswith('D') and line.endswith('*'):
@@ -801,15 +965,18 @@ def parse_gerber_stencil(infile):
         if command==2:
             point = new_point
         elif command==1:
-            path = {
-                'type': 'line',
-                'start': point,
-                'end': new_point,
-                }
-            if region_paths is None:
+            if region is None:
+                path = {
+                    'type': 'line',
+                    'start': point,
+                    'end': new_point,
+                    }
                 paths.append(path)
             else:
-                region_paths.append(path)
+                if region['first'] is None:
+                    region['first'] = point
+                region['points'].append(point)
+                region['last'] = new_point
             point = new_point
         elif command==3:
             aperture = apertures.get(selected_aperture)
@@ -817,49 +984,36 @@ def parse_gerber_stencil(infile):
                 flashes.append({
                     'center': new_point,
                     'aperture': aperture,
-                    })
+                })
             point = new_point
 
-    shapes = sort_paths(paths) if paths else []
-    polygons = []
-    for shape in shapes:
-        if distance(shape[0]['start'], shape[-1]['end'])<0.01:
-            pol = paths_to_polygon(shape)
-            if len(pol)>=3:
-                polygons.append(pol)
+    outline_info = choose_stencil_outline(paths)
+    outline = outline_info['outline']
+    outline_bounds = outline_info['bounds']
 
-    if polygons:
-        outline = max(polygons, key=lambda pol: abs(polygon_area(pol)))
-        if not is_near_rectangle(outline):
-            raise ValueError("Largest stencil outline is not rectangular")
-    else:
-        outline = path_endpoints(paths)
-        if not is_rectangular_footprint_points(outline, tolerance=0.5):
-            raise ValueError("No closed stencil outline found in Gerber file")
-
-    bounds = polygon_bounds(outline)
-    outline = rect_from_bounds(bounds)
-    flashes = [flash for flash in flashes if point_in_polygon(flash['center'], outline)]
+    flashes = [flash for flash in flashes if point_in_bounds(flash['center'], outline_bounds)]
     region_centers = []
     for region in regions:
-        if not region or distance(region[0]['start'], region[-1]['end'])>=0.01:
+        center = closed_region_center(region)
+        if center is None:
             continue
-
-        region_pol = paths_to_polygon(region)
-        if len(region_pol)<3:
-            continue
-
-        center = polygon_center(region_pol)
-        if point_in_polygon(center, outline):
+        if point_in_bounds(center, outline_bounds):
             region_centers.append(center)
 
     pads = [flash['center'] for flash in flashes] + region_centers
     if len(pads)<3:
         raise ValueError("Stencil Gerber contains fewer than 3 usable apertures inside the outline")
 
+    logging.info(
+            "Stencil parse strategy: %s, %d pads inside outline, %.3f s",
+            outline_info['strategy'],
+            len(pads),
+            time.time()-started)
+
     return {
             'outline': outline,
             'pads': pads,
+            'outline_strategy': outline_info['strategy'],
             }
 
 
@@ -1057,33 +1211,50 @@ def refine_translation(anchors, matches):
     return (dx, dy)
 
 
-def transform_stencil_points(points, flip_y=False, offset=(0, 0)):
+def transform_stencil_points(points, flip_y=False, angle_rad=0, offset=(0, 0)):
     transformed = []
     for point in points:
         p = (point[0], -point[1]) if flip_y else point
+        if angle_rad:
+            p = rotate_point_math(p, (0, 0), angle_rad)
         transformed.append((p[0]+offset[0], p[1]+offset[1]))
     return transformed
 
 
-def find_translation_match(stencil_points, pcb_points, tolerance=0.25):
+def find_rigid_match(stencil_points, pcb_points, tolerance=0.25):
     anchors = select_anchor_pads(stencil_points)
     best = None
 
-    for anchor in anchors:
-        for pcb_point in pcb_points:
-            offset = (pcb_point[0]-anchor[0], pcb_point[1]-anchor[1])
-            residual, matches = translation_matches(anchors, pcb_points, offset)
+    for i, j in itertools.permutations(range(len(anchors)), 2):
+        a1 = anchors[i]
+        a2 = anchors[j]
+        anchor_dist = distance(a1, a2)
+        if anchor_dist<0.01:
+            continue
+
+        for p1, p2 in itertools.permutations(pcb_points, 2):
+            if abs(distance(p1, p2)-anchor_dist)>tolerance:
+                continue
+
+            angle = normalize_angle_rad(angle_between(p1, p2) - angle_between(a1, a2))
+            rotated = [rotate_point_math(anchor, (0, 0), angle) for anchor in anchors]
+            offset = (p1[0]-rotated[i][0], p1[1]-rotated[i][1])
+            residual, matches = translation_matches(rotated, pcb_points, offset)
             if matches is None:
                 continue
-            refined = refine_translation(anchors, matches)
-            residual, matches = translation_matches(anchors, pcb_points, refined)
+
+            refined = refine_translation(rotated, matches)
+            residual, matches = translation_matches(rotated, pcb_points, refined)
             if matches is None:
                 continue
+
             if best is None or residual<best['residual']:
                 best = {
                         'offset': refined,
                         'residual': residual,
                         'anchors': anchors,
+                        'angle_rad': angle,
+                        'angle_deg': angle*180.0/math.pi,
                         }
 
     if best is not None and best['residual']<=tolerance:
@@ -1100,8 +1271,136 @@ def rotate_point_math(point, center, angle_rad):
             )
 
 
-def detect_rotation_required(stencil_points, pcb_points, tolerance=0.25, rotation_tolerance_deg=0.25):
+def normalize_angle_rad(angle_rad):
+    while angle_rad<=-math.pi:
+        angle_rad += 2*math.pi
+    while angle_rad>math.pi:
+        angle_rad -= 2*math.pi
+    return angle_rad
+
+
+def build_point_grid(points, cell_size):
+    grid = {}
+    for idx, point in enumerate(points):
+        key = (
+                int(math.floor(point[0]/cell_size)),
+                int(math.floor(point[1]/cell_size)),
+                )
+        grid.setdefault(key, []).append((idx, point))
+    return grid
+
+
+def nearest_unused_grid_point(point, grid, used, cell_size, tolerance):
+    cell = (
+            int(math.floor(point[0]/cell_size)),
+            int(math.floor(point[1]/cell_size)),
+            )
+    best = None
+    max_delta = max(1, int(math.ceil(tolerance/cell_size)))
+    for dx in range(-max_delta, max_delta+1):
+        for dy in range(-max_delta, max_delta+1):
+            for idx, candidate in grid.get((cell[0]+dx, cell[1]+dy), []):
+                if idx in used:
+                    continue
+                dd = distance(point, candidate)
+                if dd>tolerance:
+                    continue
+                if best is None or dd<best[1]:
+                    best = (idx, dd, candidate)
+    return best
+
+
+def validate_anchor_transform(anchors, pcb_grid, pcb_points, angle_rad, offset, tolerance):
+    transformed = transform_stencil_points(anchors, angle_rad=angle_rad, offset=offset)
+    used = set()
+    matches = []
+    residual = 0
+    for point in transformed:
+        match = nearest_unused_grid_point(point, pcb_grid, used, tolerance, tolerance)
+        if match is None:
+            return None
+        used.add(match[0])
+        matches.append(match[2])
+        residual = max(residual, match[1])
+
+    delta = refine_translation(transformed, matches)
+    refined = (offset[0]+delta[0], offset[1]+delta[1])
+    transformed = transform_stencil_points(anchors, angle_rad=angle_rad, offset=refined)
+    used = set()
+    residual = 0
+    for point in transformed:
+        match = nearest_unused_grid_point(point, pcb_grid, used, tolerance, tolerance)
+        if match is None:
+            return None
+        used.add(match[0])
+        residual = max(residual, match[1])
+
+    return {
+            'offset': refined,
+            'residual': residual,
+            'angle_rad': angle_rad,
+            'angle_deg': angle_rad*180.0/math.pi,
+            'anchors': anchors,
+            }
+
+
+def solve_transform_from_pair(source_a, source_b, target_a, target_b):
+    angle = normalize_angle_rad(angle_between(target_a, target_b) - angle_between(source_a, source_b))
+    rotated_a = rotate_point_math(source_a, (0, 0), angle)
+    offset = (target_a[0]-rotated_a[0], target_a[1]-rotated_a[1])
+    return angle, offset
+
+
+def anchor_direct_match(stencil_points, pcb_points, tolerance=0.25):
     anchors = select_anchor_pads(stencil_points)
+    pcb_anchors = select_anchor_pads(pcb_points)
+    pcb_grid = build_point_grid(pcb_points, tolerance)
+    best = None
+
+    for src in ((0, 1), (1, 0)):
+        for dst in itertools.permutations(range(len(pcb_anchors)), 2):
+            angle, offset = solve_transform_from_pair(
+                    anchors[src[0]],
+                    anchors[src[1]],
+                    pcb_anchors[dst[0]],
+                    pcb_anchors[dst[1]])
+            match = validate_anchor_transform(anchors, pcb_grid, pcb_points, angle, offset, tolerance)
+            if match is not None and (best is None or match['residual']<best['residual']):
+                best = match
+
+    if best is not None:
+        best['strategy'] = 'anchor_direct'
+    return best
+
+
+def pair_distance_match(stencil_points, pcb_points, tolerance=0.25):
+    anchors = select_anchor_pads(stencil_points)
+    pair = (anchors[0], anchors[1])
+    anchor_dist = distance(pair[0], pair[1])
+    pcb_grid = build_point_grid(pcb_points, tolerance)
+    best = None
+
+    for i in range(len(pcb_points)):
+        p1 = pcb_points[i]
+        for j in range(i+1, len(pcb_points)):
+            p2 = pcb_points[j]
+            if abs(distance(p1, p2)-anchor_dist)>tolerance:
+                continue
+            for source_a, source_b in ((pair[0], pair[1]), (pair[1], pair[0])):
+                for target_a, target_b in ((p1, p2), (p2, p1)):
+                    angle, offset = solve_transform_from_pair(source_a, source_b, target_a, target_b)
+                    match = validate_anchor_transform(anchors, pcb_grid, pcb_points, angle, offset, tolerance)
+                    if match is not None and (best is None or match['residual']<best['residual']):
+                        best = match
+
+    if best is not None:
+        best['strategy'] = 'pair_distance'
+    return best
+
+
+def exhaustive_rigid_match(stencil_points, pcb_points, tolerance=0.25):
+    anchors = select_anchor_pads(stencil_points)
+    pcb_grid = build_point_grid(pcb_points, tolerance)
     best = None
 
     for i, j in itertools.permutations(range(len(anchors)), 2):
@@ -1115,57 +1414,74 @@ def detect_rotation_required(stencil_points, pcb_points, tolerance=0.25, rotatio
             if abs(distance(p1, p2)-anchor_dist)>tolerance:
                 continue
 
-            angle = angle_between(p1, p2) - angle_between(a1, a2)
-            rotated = [rotate_point_math(anchor, a1, angle) for anchor in anchors]
-            offset = (p1[0]-rotated[i][0], p1[1]-rotated[i][1])
-            residual, _matches = translation_matches(rotated, pcb_points, offset)
-            if residual is None:
-                continue
-
-            angle_deg = abs(angle*180.0/math.pi)
-            while angle_deg>180:
-                angle_deg = abs(angle_deg-360)
-            if best is None or residual<best['residual']:
-                best = {
-                        'residual': residual,
-                        'angle_deg': angle_deg,
-                        }
-
-    if best is not None and best['residual']<=tolerance and best['angle_deg']>rotation_tolerance_deg:
-        return best['angle_deg']
-
-    return None
-
-
-def match_stencil_to_pcb_pads(stencil_points, pcb_pads, tolerance=0.25, rotation_tolerance_deg=0.25):
-    pcb_points = [pad['center'] if type(pad) is dict else pad for pad in pcb_pads]
-    best = None
-    rotation_required = None
-
-    for flip_y in (False, True):
-        variant = transform_stencil_points(stencil_points, flip_y=flip_y)
-        match = find_translation_match(variant, pcb_points, tolerance=tolerance)
-        if match is not None:
-            match['flip_y'] = flip_y
-            if best is None or match['residual']<best['residual']:
+            angle, offset = solve_transform_from_pair(a1, a2, p1, p2)
+            match = validate_anchor_transform(anchors, pcb_grid, pcb_points, angle, offset, tolerance)
+            if match is not None and (best is None or match['residual']<best['residual']):
                 best = match
-            continue
-
-        angle = detect_rotation_required(variant, pcb_points, tolerance=tolerance, rotation_tolerance_deg=rotation_tolerance_deg)
-        if angle is not None and (rotation_required is None or angle<rotation_required):
-            rotation_required = angle
 
     if best is not None:
-        return best
+        best['strategy'] = 'exhaustive_rigid'
+    return best
 
-    if rotation_required is not None:
-        raise ValueError("Stencil alignment would require %.3f degrees of rotation, which is unsupported" % (rotation_required,))
+
+def strategy_label(strategy):
+    return getattr(strategy, '__name__', str(strategy))
+
+
+def match_stencil_to_pcb_pads(stencil_points, pcb_pads, tolerance=0.25):
+    pcb_points = [pad['center'] if type(pad) is dict else pad for pad in pcb_pads]
+    best = None
+    started = time.time()
+    strategies = (
+            anchor_direct_match,
+            pair_distance_match,
+            exhaustive_rigid_match,
+            )
+    early_exit_residual = tolerance * 0.5
+
+    for flip_y in (True, False):
+        variant = transform_stencil_points(stencil_points, flip_y=flip_y)
+        for strategy in strategies:
+            strategy_started = time.time()
+            match = strategy(variant, pcb_points, tolerance=tolerance)
+            elapsed = time.time()-strategy_started
+            if match is None:
+                logging.debug(
+                        "Stencil match strategy %s (%s) failed in %.3f s",
+                        strategy_label(strategy),
+                        'flip_y' if flip_y else 'native',
+                        elapsed)
+                continue
+
+            match['flip_y'] = flip_y
+            match['strategy'] = match.get('strategy', strategy_label(strategy))
+            logging.info(
+                    "Stencil match strategy: %s (%s), residual %.3f mm, rotation %.3f deg, %.3f s",
+                    match['strategy'],
+                    'flip_y' if flip_y else 'native',
+                    match['residual'],
+                    match['angle_deg'],
+                    elapsed)
+            if best is None or match['residual']<best['residual']:
+                best = match
+            if match['residual']<=early_exit_residual:
+                logging.info("Stencil matching completed in %.3f s", time.time()-started)
+                return best
+            break
+
+    if best is not None:
+        logging.info("Stencil matching completed in %.3f s", time.time()-started)
+        return best
 
     raise ValueError("Could not match stencil apertures to PCB paste pads")
 
 
 def aligned_stencil_polygon(stencil_polygon, alignment):
-    return transform_stencil_points(stencil_polygon, flip_y=alignment.get('flip_y', False), offset=alignment['offset'])
+    return transform_stencil_points(
+            stencil_polygon,
+            flip_y=alignment.get('flip_y', False),
+            angle_rad=alignment.get('angle_rad', 0),
+            offset=alignment['offset'])
 
 
 def is_supported_stencil_file(path):
@@ -1360,7 +1676,11 @@ def main():
             alignment = match_stencil_to_pcb_pads(stencil['pads'], pcb_pads)
             stencil_raw = aligned_stencil_polygon(stencil['outline'], alignment)
             pol_stencil = transform_polygon(stencil_raw, pth_c, mirror_y=True, mirror_x=args.mirror)
-            logging.info("Using stencil file bounds; matched %s with residual %.3f mm", paste_layer, alignment['residual'])
+            logging.info(
+                    "Using stencil file bounds; matched %s with residual %.3f mm and rotation %.3f deg",
+                    paste_layer,
+                    alignment['residual'],
+                    alignment.get('angle_deg', 0))
         except (IOError, ValueError) as e:
             logging.error(str(e))
             return 1

@@ -23,6 +23,7 @@ This fork adds a few workflow improvements for PCB/stencil alignment:
 - Fill large internal PCB voids with `--fill-voids`, with `--min-void-area` defaulting to `15 mm^2`.
 - Choose the PCB lift cutout position with `--lift-hole-position`.
 - Keep separate PCB and stencil clearance controls with `--offset` and `--stencil-offset`.
+- Generate a stencil frame from KiCad with a toolbar action plugin.
 
 ## Usage
 
@@ -99,3 +100,30 @@ options:
 ```
 
 For JLCPCB stencil output, use the Gerber file from the downloaded stencil fabrication/design files as `--stencil-file`. This replaces manually choosing `-l`, `-r`, `-t`, and `-b` because the generated fixture is sized from the stencil outline and aligned from the stencil apertures.
+
+## KiCad plugin
+
+This fork includes a KiCad action plugin in `kicad_plugin/stencilframer_plugin`.
+
+To install through KiCad's Plugin and Content Manager, build the PCM archive first:
+
+```
+> python3 kicad_plugin/build_pcm_package.py
+```
+
+Then install `kicad_plugin/stencilframer-kicad-plugin.zip` with **Install from File**. Do not use a GitHub/source zip directly: KiCad PCM requires an archive with `metadata.json` at the root and plugin files under `plugins/`.
+
+For manual installation instead, symlink the `stencilframer_plugin` directory into KiCad's scripting plugins directory.
+
+The PCM archive bundles `stencilframer.py` inside the plugin, so it can run without a separate source checkout. The plugin runs the bundled generator inside KiCad's Python process, so it does not try to open the script as a KiCad project. If OpenSCAD is not found on `PATH`, the plugin shows an OpenSCAD executable picker before creating the frame.
+
+The plugin adds a `Stencilframer` button to the PCB editor toolbar. Clicking it opens a dialog where you choose:
+
+- A stencil Gerber file, or a `.zip` file containing a Gerber file.
+- An output path, defaulting to `stencil_frame.stl` in the KiCad project directory.
+- The OpenSCAD executable, only if it is not found on `PATH` or if you previously chose a custom executable.
+- Front or back side, lift-hole location, and PCB/stencil clearance settings.
+- PCB thickness is read automatically from the KiCad board file.
+- The plugin remembers its user-set defaults after you click `Create`.
+
+Click `Create` to run `stencilframer.py --stencil-file ...`. The dialog shows the command log while it runs. When generation succeeds, it shows `Reveal in Finder` on macOS, `Reveal in Explorer` on Windows, or `Reveal in File Manager` on Linux. If generation fails, the error stays in the log.
